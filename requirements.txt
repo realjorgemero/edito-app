@@ -1,0 +1,6 @@
+# Una sola instalación:  pip install -r requirements.txt
+flask>=3.0          # la interfaz web en localhost
+faster-whisper>=1.0 # subtítulos automáticos (descarga el modelo la 1ª vez)
+pywebview>=5.0       # ventana nativa de escritorio (usa el webview del
+                     # sistema, no Electron); si falta, app.py cae solo a
+                     # modo navegador

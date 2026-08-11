@@ -1,0 +1,20 @@
+# Build de PyInstaller (se regenera con build_installer.ps1)
+build/
+dist/
+*.spec
+
+# Binarios de ffmpeg embebidos – demasiado grandes para git (>100MB cada
+# uno) y se copian localmente desde cualquier instalación de ffmpeg, ver
+# PASO-A-PASO.md.
+vendor/ffmpeg/*.exe
+
+# Datos locales de una corrida de desarrollo (en producción empaquetada
+# viven en %LOCALAPPDATA%\Edito, fuera del repo de todos modos)
+jobs/
+presets.json
+demo.mp4
+demo_cover.jpg
+
+# Python
+__pycache__/
+*.pyc

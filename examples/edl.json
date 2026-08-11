@@ -1,0 +1,165 @@
+{
+  "canvas_w": 1080,
+  "canvas_h": 1920,
+  "fps": 30,
+  "captions": true,
+  "caption_accent": "#F4DC1A",
+  "opening_sting": "examples\\sfx\\impact.wav",
+  "closing_sting": "examples\\sfx\\impact.wav",
+  "shots": [
+    {
+      "source": "examples\\clips\\toma_0.mp4",
+      "script": "Nadie te contó esto sobre editar videos",
+      "word_timings": [
+        {
+          "w": "Nadie",
+          "t0": 1.35,
+          "t1": 1.771
+        },
+        {
+          "w": "te",
+          "t0": 1.821,
+          "t1": 2.243
+        },
+        {
+          "w": "contó",
+          "t0": 2.293,
+          "t1": 2.714
+        },
+        {
+          "w": "esto",
+          "t0": 2.764,
+          "t1": 3.186
+        },
+        {
+          "w": "sobre",
+          "t0": 3.236,
+          "t1": 3.657
+        },
+        {
+          "w": "editar",
+          "t0": 3.707,
+          "t1": 4.129
+        },
+        {
+          "w": "videos",
+          "t0": 4.179,
+          "t1": 4.6
+        }
+      ]
+    },
+    {
+      "source": "examples\\clips\\toma_1.mp4",
+      "script": "El problema no es tu cámara, es tu montaje",
+      "word_timings": [
+        {
+          "w": "El",
+          "t0": 1.35,
+          "t1": 1.667
+        },
+        {
+          "w": "problema",
+          "t0": 1.717,
+          "t1": 2.033
+        },
+        {
+          "w": "no",
+          "t0": 2.083,
+          "t1": 2.4
+        },
+        {
+          "w": "es",
+          "t0": 2.45,
+          "t1": 2.767
+        },
+        {
+          "w": "tu",
+          "t0": 2.817,
+          "t1": 3.133
+        },
+        {
+          "w": "cámara,",
+          "t0": 3.183,
+          "t1": 3.5
+        },
+        {
+          "w": "es",
+          "t0": 3.55,
+          "t1": 3.867
+        },
+        {
+          "w": "tu",
+          "t0": 3.917,
+          "t1": 4.233
+        },
+        {
+          "w": "montaje",
+          "t0": 4.283,
+          "t1": 4.6
+        }
+      ]
+    },
+    {
+      "source": "examples\\clips\\toma_2.mp4",
+      "script": "Descarga la receta y empieza sin excusas hoy",
+      "word_timings": [
+        {
+          "w": "Descarga",
+          "t0": 1.35,
+          "t1": 1.712
+        },
+        {
+          "w": "la",
+          "t0": 1.762,
+          "t1": 2.125
+        },
+        {
+          "w": "receta",
+          "t0": 2.175,
+          "t1": 2.537
+        },
+        {
+          "w": "y",
+          "t0": 2.587,
+          "t1": 2.95
+        },
+        {
+          "w": "empieza",
+          "t0": 3.0,
+          "t1": 3.362
+        },
+        {
+          "w": "sin",
+          "t0": 3.412,
+          "t1": 3.775
+        },
+        {
+          "w": "excusas",
+          "t0": 3.825,
+          "t1": 4.188
+        },
+        {
+          "w": "hoy",
+          "t0": 4.237,
+          "t1": 4.6
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "transition": "fadewhite",
+      "duration_s": 0.35,
+      "sfx": "examples\\sfx\\impact.wav",
+      "sfx_peak_offset_s": 0.0125625,
+      "sfx_gain": 0.82
+    },
+    {
+      "transition": "zoomin",
+      "duration_s": 0.32,
+      "sfx": "examples\\sfx\\whoosh.wav",
+      "sfx_peak_offset_s": 0.562625,
+      "sfx_gain": 0.82
+    }
+  ]
+}
