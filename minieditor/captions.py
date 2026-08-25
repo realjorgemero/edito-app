@@ -37,6 +37,7 @@ producción NO lo hace – es una de sus deudas conocidas.)
 from __future__ import annotations
 
 import os
+import sys
 
 from . import ff
 
@@ -100,8 +101,8 @@ def _hex_to_ass(color: str) -> str:
     return f"&H{c[4:6]}{c[2:4]}{c[0:2]}&".upper()
 
 
-def _chunk(words: list[dict]) -> list[list[list[dict]]]:
-    """words → bloques; cada bloque = hasta 2 líneas de hasta 3 palabras."""
+def _chunk(words: list[dict], max_lines: int = MAX_LINES) -> list[list[list[dict]]]:
+    """words → bloques; cada bloque = hasta max_lines líneas de hasta 3 palabras."""
     lines, line = [], []
     for w in words:
         line.append(w)
@@ -110,7 +111,7 @@ def _chunk(words: list[dict]) -> list[list[list[dict]]]:
             line = []
     if line:
         lines.append(line)
-    return [lines[i:i + MAX_LINES] for i in range(0, len(lines), MAX_LINES)]
+    return [lines[i:i + max_lines] for i in range(0, len(lines), max_lines)]
 
 
 def _ts(seconds: float) -> str:
@@ -123,13 +124,17 @@ def _ts(seconds: float) -> str:
 
 def build_ass(words: list[dict], out_path: str, canvas_w: int = 1080,
               canvas_h: int = 1920, accent: str = "#F4DC1A",
-              font: str = FONT, position: str = "abajo") -> str:
+              font: str = FONT, position: str = "abajo",
+              bold: bool = True, italic: bool = False,
+              max_lines: int = MAX_LINES) -> str:
     """words: [{"w": str, "t0": float, "t1": float}] en tiempo ABSOLUTO
     del video final. Genera el .ass y devuelve su ruta."""
     accent_ass = _hex_to_ass(accent)
     fontsize = round(canvas_h * 0.0479)          # 4.79 % de la altura
     margin_h = round(canvas_w * 0.1389)          # 13.89 % del ancho
     margin_v = round(canvas_h * POSITIONS.get(position, POSITIONS["abajo"]))
+    ass_bold = "-1" if bold else "0"
+    ass_italic = "-1" if italic else "0"
 
     header = f"""[Script Info]
 ScriptType: v4.00+
@@ -140,14 +145,14 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Karaoke,{font},{fontsize},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,0,8,{margin_h},{margin_h},{margin_v},1
+Style: Karaoke,{font},{fontsize},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,{ass_bold},{ass_italic},0,0,100,100,0,0,1,3,0,8,{margin_h},{margin_h},{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
     events = []
-    blocks = _chunk(words)
+    blocks = _chunk(words, max_lines)
 
     for bi, block in enumerate(blocks):
         flat = [w for line in block for w in line]
@@ -198,6 +203,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return out_path
 
 
+def fonts_dir() -> str:
+    """Carpeta con fuentes propias, embebida junto al resto de la app
+    (ver build_installer.ps1, --add-data). app.py también la usa para
+    servirlas al navegador (@font-face, así el preview coincide con el
+    quemado final)."""
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    else:
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "assets", "fonts")
+
+
 def burn(video: str, ass_path: str, workdir: str) -> str:
     """Quema el .ass sobre el video.
 
@@ -212,14 +229,27 @@ def burn(video: str, ass_path: str, workdir: str) -> str:
     es fiable en todas las versiones – reventaba con "Unable to parse
     'original_size'..." (el ':' partía la ruta en dos valores). En vez de
     pelear con el escape, lo evitamos: corremos ffmpeg parado en la
-    carpeta del .ass (cwd) y le pasamos solo su nombre, que nunca tiene
-    ':'. -i y la salida sí pueden ser absolutos: esos no pasan por el
-    parser de filtros.
+    carpeta del .ass (cwd) y le pasamos solo nombres RELATIVOS a ese cwd
+    (el .ass, y fontsdir más abajo), que nunca tienen ':'. -i y la salida
+    sí pueden ser absolutos: esos no pasan por el parser de filtros.
+
+    fontsdir: le dice a libass dónde están nuestras fuentes propias
+    (assets/fonts/). Hace falta de verdad – se comprobó con
+    `ffmpeg -v verbose` que esta build usa el proveedor DirectWrite (no
+    fontconfig, a pesar de que el binario lo trae compilado: DirectWrite
+    gana cuando ambos están disponibles). DirectWrite SOLO ve fuentes
+    instaladas de verdad en Windows; una fuente que solo vive en una
+    carpeta es invisible para él sin este parámetro – cae siempre al
+    mismo fallback genérico (Arial-BoldMT), no importa cuál se haya
+    elegido en la UI. `fontsdir` la resuelve pasándosela directo a
+    libass, que la suma a su propio catálogo sin importar qué proveedor
+    de fuentes del sistema esté usando por debajo.
     """
     out = os.path.join(workdir, "final.mp4")
     ass_dir = os.path.dirname(os.path.abspath(ass_path))
     ass_name = os.path.basename(ass_path)
-    ff.run(["-i", os.path.abspath(video), "-vf", f"ass={ass_name}",
+    fonts_rel = os.path.relpath(fonts_dir(), ass_dir).replace(os.sep, "/")
+    ff.run(["-i", os.path.abspath(video), "-vf", f"ass={ass_name}:fontsdir={fonts_rel}",
             "-c:v", "libx264", "-preset", "fast", "-crf", "18",
             "-pix_fmt", "yuv420p", "-c:a", "copy",
             "-movflags", "+faststart", os.path.abspath(out)],

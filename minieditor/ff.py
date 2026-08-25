@@ -35,6 +35,13 @@ FFMPEG = _tool_path("ffmpeg")
 FFPROBE = _tool_path("ffprobe")
 DEFAULT_TIMEOUT = 600  # segundos; ningún paso de este mini-editor debería tardar más
 
+# En el .exe empaquetado (console=False) el proceso principal no tiene
+# consola propia, así que cada subprocess.run de ffmpeg/ffprobe abre (y
+# flashea) la SUYA por default en Windows. CREATE_NO_WINDOW se lo evita.
+# Todo módulo que llame subprocess directo con FFMPEG/FFPROBE (gates.py,
+# peaks.py, thumbnail.py) debe pasar creationflags=NO_WINDOW_FLAGS.
+NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
 
 class FfmpegError(RuntimeError):
     pass
@@ -57,7 +64,8 @@ def run(args: list[str], timeout: int = DEFAULT_TIMEOUT, quiet: bool = True,
     contiene ':'.
     """
     cmd = [FFMPEG, "-y", "-hide_banner"] + (["-nostats"] if quiet else []) + args
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd,
+                        creationflags=NO_WINDOW_FLAGS)
     if p.returncode != 0:
         # La cola de stderr, no la cabeza: ffmpeg imprime banner primero
         # y el error real queda al final. (Lección aprendida en producción.)
@@ -69,7 +77,8 @@ def probe(path: str, timeout: int = 30) -> dict:
     """ffprobe → dict con streams y format."""
     cmd = [FFPROBE, "-v", "quiet", "-print_format", "json",
            "-show_streams", "-show_format", path]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                        creationflags=NO_WINDOW_FLAGS)
     if p.returncode != 0:
         raise FfmpegError(f"ffprobe falló sobre {path}:\n{p.stderr[-500:]}")
     return json.loads(p.stdout)

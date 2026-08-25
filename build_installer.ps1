@@ -22,6 +22,7 @@
 pyinstaller --name Edito --onefile --windowed --icon assets\edito.ico `
   --add-binary "vendor\ffmpeg\ffmpeg.exe;." `
   --add-binary "vendor\ffmpeg\ffprobe.exe;." `
+  --add-data "assets\fonts;assets\fonts" `
   --collect-all faster_whisper `
   --collect-all ctranslate2 `
   --collect-all webview `

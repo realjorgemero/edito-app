@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -28,6 +29,14 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+
+# En el .exe empaquetado (console=False) no hay consola adjunta, así que
+# sys.stdout/stderr son None – cualquier print() los revienta con
+# AttributeError. Los mandamos a devnull para que print() siga andando.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 # La consola de Windows usa por defecto un codepage (cp1252) que no sabe
 # imprimir los símbolos que usamos en los mensajes (→, ✅). Sin esto, el
@@ -52,7 +61,7 @@ else:
     DATA_DIR = BASE_DIR
 os.makedirs(DATA_DIR, exist_ok=True)
 
-from flask import Flask, render_template_string, request, send_file
+from flask import Flask, render_template_string, request, send_file, send_from_directory
 
 import icongen
 from minieditor import asr, captions, concat, gates, loudnorm, music, normalize, sfx, thumbnail, trim
@@ -63,9 +72,11 @@ from minieditor.peaks import measure_peak
 # ─── Versión y chequeo de actualizaciones ──────────────────────────────
 # Subí cada nueva versión del .exe a un Release de GitHub con tag "vX.Y.Z"
 # (ver build_installer.ps1). UPDATE_REPO queda vacío hasta que crees ese
-# repo – con eso, /update-check se auto-desactiva solo (fail-open, nunca
-# bloquea el arranque de la app).
-EDITO_VERSION = "1.0.0"
+# repo – con eso, _check_for_update() se auto-desactiva sola (fail-open,
+# nunca bloquea el arranque de la app). Se resuelve DENTRO de index(),
+# no vía un fetch de JS aparte – ver el comentario en el <template> de
+# PAGE, cerca de "update-banner", para el porqué.
+EDITO_VERSION = "1.1.0"
 UPDATE_REPO = "realjorgemero/edito-app"
 # ─────────────────────────────────────────────────────────────────────
 
@@ -80,9 +91,13 @@ FEATURES = {
 }
 # ─────────────────────────────────────────────────────────────────────
 
-# Fuentes ofrecidas para los subtítulos: nombres de familia tal como los
-# resuelve libass vía DirectWrite en Windows. Todas vienen preinstaladas
-# con Windows, así que no hace falta embeberlas.
+# Fuentes ofrecidas para los subtítulos: nombres de familia tal como
+# libass las resuelve. Esta build de ffmpeg usa el proveedor DirectWrite
+# (confirmado con `ffmpeg -v verbose`), que solo ve fuentes REALMENTE
+# instaladas en Windows – por eso las de sistema (Arial, Impact, etc.) no
+# hace falta embeberlas. Las que no vienen con Windows viven como archivo
+# en assets/fonts/ (con su licencia) y viajan a libass vía `fontsdir` en
+# minieditor/captions.py (burn) – están marcadas abajo.
 FONT_CHOICES = [
     ("Arial", "Arial"),
     ("Segoe UI", "Segoe UI (moderna)"),
@@ -91,7 +106,26 @@ FONT_CHOICES = [
     ("Verdana", "Verdana"),
     ("Comic Sans MS", "Comic Sans"),
     ("Trebuchet MS", "Trebuchet"),
+    ("Bowlby One SC", "Bowlby One SC (display, mayúsculas)"),  # assets/fonts/
+    ("Anton", "Anton (bold condensada, captions)"),  # assets/fonts/
+    ("Bebas Neue", "Bebas Neue (condensada, títulos)"),  # assets/fonts/
+    ("Poppins ExtraBold", "Poppins ExtraBold (moderna, legible)"),  # assets/fonts/
 ]
+
+# Nombre de familia -> archivo, para las fuentes de FONT_CHOICES que NO
+# vienen con Windows (viven en assets/fonts/, ver captions.fonts_dir()).
+# Sirve para dos cosas: la ruta /fonts/<archivo> de abajo, y el
+# @font-face que le mete el navegador para que el preview de la UI
+# coincida con lo que se quema en el video (si no, el preview cae al
+# font-family por defecto del navegador para cualquier fuente que no
+# esté instalada en el sistema).
+EMBEDDED_FONT_FILES = {
+    "Bowlby One SC": "BowlbyOneSC-Regular.ttf",
+    "Anton": "Anton-Regular.ttf",
+    "Bebas Neue": "BebasNeue-Regular.ttf",
+    "Poppins ExtraBold": "Poppins-ExtraBold.ttf",
+}
+FONTS_DIR = captions.fonts_dir()
 
 # Favicon: el mismo isotipo de "E" que usa .brand en el <head>, pre-codificado
 # como data URI (self-contained, sin servir un archivo aparte). Fondo sólido
@@ -125,6 +159,13 @@ JOBS_LOCK = threading.Lock()
 JOB_TTL_HOURS = 24 * 30  # 30 días: también es la ventana de retención del
                          # historial (ver /history) – pasado esto, un
                          # proyecto se borra solo (disco y memoria)
+
+# ─── Descarga de actualización: mismo patrón que JOBS (hilo de background
+# + polling), un solo estado global porque a lo sumo hay una descarga de
+# actualización a la vez. `path` solo se llena cuando status=="ready" – es
+# el que apply_update() (ver Api en __main__) copia sobre el .exe actual.
+UPDATE_DL_STATE: dict = {"status": "idle"}
+UPDATE_DL_LOCK = threading.Lock()
 
 # ─── Presets de marca: combinación con nombre de fuente/color/posición/
 # transición, para no reconfigurar todo cada vez. Un solo JSON chico junto
@@ -171,6 +212,12 @@ PAGE = """
 <title>Edito</title>
 <link rel="icon" type="image/svg+xml" href="{{ favicon }}">
 <style>
+  {# Fuentes propias (no instaladas en Windows): sin esto el preview de
+     abajo cae al font-family por defecto del navegador aunque el video
+     final sí las queme bien (las resuelve fontconfig, no el navegador). #}
+  {% for name, filename in embedded_fonts.items() %}
+  @font-face { font-family: "{{ name }}"; src: url("/fonts/{{ filename }}"); }
+  {% endfor %}
   :root { --bg:#05070d; --card-border:rgba(255,255,255,.08); --ink:#eef2ff;
           --dim:#8b96ab; --blue1:#bcd2ff; --blue2:#3b6fff; --blue3:#1638c9;
           --ok:#3ddc84; --bad:#ff5d5d; color-scheme:dark;
@@ -236,6 +283,11 @@ PAGE = """
   .filelist li.dragover { border-color:var(--blue2); }
   .filelist-row { display:flex; align-items:center; gap:10px; }
   .filelist .grip { color:var(--dim); font-size:14px; user-select:none; }
+  .filelist .thumb { width:26px; height:46px; border-radius:6px; flex-shrink:0;
+                 background-color:rgba(255,255,255,.06); background-size:cover;
+                 background-position:center; }
+  .filelist .thumb-empty { display:flex; align-items:center; justify-content:center;
+                 color:var(--dim); font-size:12px; }
   .filelist .n { color:var(--blue1); font-weight:700; min-width:18px; }
   .filelist .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .filelist .size { color:var(--dim); font-size:13px; }
@@ -318,7 +370,6 @@ PAGE = """
            outline:none; border-color:var(--blue2); background:rgba(255,255,255,.09); }
   select option { background:#0b1020; color:var(--ink); }
   input[type=color] { padding:2px; width:44px; height:36px; cursor:pointer; }
-  .hidden { display:none; }
   .fontpick { display:flex; align-items:center; gap:10px; }
   .fontpreview { font-size:19px; font-weight:800; color:var(--blue1);
            min-width:30px; text-align:center; }
@@ -361,12 +412,13 @@ PAGE = """
               transition:transform 350ms var(--ease-in-out); }
   #progpct { font-size:12px; color:var(--dim); min-width:34px; text-align:right; }
   #preview { width:100%; border-radius:16px; margin-bottom:12px; background:#000; display:block; }
-  #result a { display:block; text-align:center; background:linear-gradient(135deg,#5eeaa8,#1fae63);
-              color:#04150a; font-weight:800; border-radius:999px; padding:16px;
+  #result a, #result button.dl-btn { display:block; width:100%; text-align:center;
+              background:linear-gradient(135deg,#5eeaa8,#1fae63); font:inherit; border:none;
+              color:#04150a; font-weight:800; border-radius:999px; padding:16px; cursor:pointer;
               text-decoration:none; box-shadow:0 10px 30px -10px rgba(40,220,130,.6);
               transition:transform 120ms var(--ease-out); }
-  #result a:active { transform:scale(.97); }
-  #result a.secondary { background:rgba(255,255,255,.06); color:var(--ink);
+  #result a:active, #result button.dl-btn:active { transform:scale(.97); }
+  #result a.secondary, #result button.dl-btn.secondary { background:rgba(255,255,255,.06); color:var(--ink);
               box-shadow:none; margin-top:10px; font-weight:600; }
   #result img.cover { width:100%; border-radius:16px; margin-bottom:12px; display:block; }
   .subword { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
@@ -429,18 +481,28 @@ PAGE = """
   @media (hover:hover) and (pointer:fine) {
     .historybtn:hover { border-color:var(--blue2); color:var(--ink); }
   }
-  .update-banner { display:flex; align-items:center; gap:10px; padding:11px 14px;
+  .update-banner { display:flex; flex-direction:column; gap:8px; padding:11px 14px;
            border-radius:12px; background:linear-gradient(135deg, rgba(61,220,132,.14), rgba(61,220,132,.06));
            border:1px solid rgba(61,220,132,.3); margin-bottom:18px; font-size:13px;
            animation:riseIn 240ms var(--ease-out) backwards; }
+  .update-row { display:flex; align-items:center; gap:10px; }
   .update-banner span { flex:1; color:var(--ink); line-height:1.4; }
   .update-btn { background:linear-gradient(135deg,var(--blue1),var(--blue2)); color:#04070d;
            font-weight:800; border-radius:999px; padding:7px 14px; text-decoration:none;
-           font-size:12px; flex-shrink:0; transition:transform 100ms var(--ease-out); }
+           font-size:12px; flex-shrink:0; border:none; cursor:pointer; font:inherit; font-weight:800;
+           transition:transform 100ms var(--ease-out); }
   .update-btn:active { transform:scale(.95); }
+  .update-btn:disabled { opacity:.6; cursor:wait; }
   .update-dismiss { background:none; border:none; color:var(--dim); font-size:16px;
            cursor:pointer; padding:0 2px; flex-shrink:0; transition:transform 100ms var(--ease-out); }
   .update-dismiss:active { transform:scale(.85); }
+  .update-progwrap { display:none; align-items:center; gap:10px; }
+  .update-progbar { flex:1; height:6px; border-radius:999px; background:rgba(255,255,255,.08);
+           overflow:hidden; }
+  .update-progfill { height:100%; width:0%; border-radius:999px;
+           background:linear-gradient(90deg,var(--blue1),var(--blue2));
+           transition:width 200ms var(--ease-out); }
+  .update-progwrap span { flex:none; font-size:11px; color:var(--dim); min-width:32px; text-align:right; }
   .preset-row { display:flex; gap:8px; align-items:center; padding-bottom:14px;
            margin-bottom:14px; border-bottom:1px solid rgba(255,255,255,.06); }
   .preset-row select { flex:1; min-width:0; }
@@ -538,11 +600,32 @@ PAGE = """
     </button>
   </div>
 
-  <div class="update-banner hidden" id="updateBanner">
-    <span id="updateText"></span>
-    <a class="update-btn" id="updateDownload" href="#" target="_blank" rel="noopener">Descargar</a>
-    <button type="button" class="update-dismiss" id="updateDismiss" title="Cerrar">×</button>
+  {% if update.update_available %}
+  {# Chequeo de actualización resuelto DEL LADO DEL SERVIDOR, directo acá
+     en index() (ver _check_for_update en app.py) – a propósito, NO vía
+     fetch de JavaScript como antes. WebView2 (la ventana nativa) tiene su
+     propio caché en disco que sobrevive a cerrar y reabrir la app entera,
+     y insistía en servir una respuesta vieja de ese fetch aparte sin
+     importar qué headers de no-cache le pusiéramos – tres rounds de
+     parches distintos no lo arreglaron. Esta página ("/") sí se
+     recarga entera y sin caché en cada apertura (confirmado repetidas
+     veces), así que resolver el chequeo ACÁ, en la misma respuesta,
+     elimina el recurso aparte que WebView2 podía cachear mal – no hay
+     nada que cachear si nunca se vuelve a pedir. #}
+  <div class="update-banner" id="updateBanner"
+       data-url="{{ update.download_url or update.notes_url }}"
+       data-version="{{ update.latest_version }}">
+    <div class="update-row">
+      <span id="updateMsg">Hay una versión nueva de Edito (v{{ update.latest_version }}) – la tuya es v{{ update.current_version }}.</span>
+      <button type="button" class="update-btn" id="updateActionBtn">Actualizar</button>
+      <button type="button" class="update-dismiss" id="updateDismiss" title="Cerrar">×</button>
+    </div>
+    <div class="update-progwrap" id="updateProgwrap">
+      <div class="update-progbar"><div class="update-progfill" id="updateProgfill"></div></div>
+      <span id="updateProgpct">0%</span>
+    </div>
   </div>
+  {% endif %}
 
   <h1>Tus tomas,<br><span class="accent">un video editado.</span></h1>
   <p class="sub">Subí tus clips en orden – llevate el MP4 con volumen y montaje profesional.</p>
@@ -633,6 +716,16 @@ PAGE = """
     </div>
     <div class="frow">
       <div class="ftext">
+        <div class="ftitle">Estilo</div>
+        <div class="fdesc">Negrita y/o cursiva para todo el texto quemado.</div>
+      </div>
+      <div class="fontpick">
+        <label class="connector-toggle"><input type="checkbox" id="subBold" checked> Negrita</label>
+        <label class="connector-toggle"><input type="checkbox" id="subItalic"> Cursiva</label>
+      </div>
+    </div>
+    <div class="frow">
+      <div class="ftext">
         <div class="ftitle">Posición</div>
         <div class="fdesc">Dónde se ancla el bloque de subtítulos en el cuadro.</div>
       </div>
@@ -640,6 +733,16 @@ PAGE = """
         <option value="arriba">Arriba</option>
         <option value="medio">Medio</option>
         <option value="abajo" selected>Abajo</option>
+      </select>
+    </div>
+    <div class="frow">
+      <div class="ftext">
+        <div class="ftitle">Texto en pantalla</div>
+        <div class="fdesc">Cuánto se ve a la vez. Menos texto = más impacto por palabra.</div>
+      </div>
+      <select id="subLines">
+        <option value="1">Poco (3 palabras, 1 línea)</option>
+        <option value="2" selected>Normal (6 palabras, 2 líneas)</option>
       </select>
     </div>
     {% endif %}
@@ -745,13 +848,49 @@ const picker = document.getElementById('picker');
 const list = document.getElementById('list');
 
 picker.addEventListener('change', () => {
-  tomas.push(...Array.from(picker.files).map(f => ({
-    file: f, name: f.name, size: f.size, existing: false,
+  const nuevas = Array.from(picker.files).map(f => ({
+    file: f, name: f.name, size: f.size, existing: false, thumb: null,
     trimStart: null, trimEnd: null, trimOpen: false, sfxAfter: true,
-  })));
+  }));
+  tomas.push(...nuevas);
   picker.value = '';          // permite volver a elegir el mismo archivo
   renderList();
+  nuevas.forEach(t => generateThumb(t).then(() => renderList()));
 });
+
+// Miniatura por toma: 100% en el navegador, sin subir nada al servidor
+// todavía (los archivos recién viajan al hacer click en Editar). Un
+// <video> oculto carga el File local, se posiciona a 0.3s, y un <canvas>
+// lo captura como JPG chico – así podés distinguir las tomas por su
+// primer frame en vez de solo por nombre de archivo al reordenarlas.
+function generateThumb(t) {
+  return new Promise((resolve) => {
+    if (t.existing || !t.file) { resolve(); return; }
+    const url = URL.createObjectURL(t.file);
+    const video = document.createElement('video');
+    video.muted = true;
+    video.preload = 'metadata';
+    video.src = url;
+    const cleanup = () => URL.revokeObjectURL(url);
+    video.addEventListener('loadeddata', () => {
+      video.currentTime = Math.min(0.3, (video.duration || 1) / 2);
+    });
+    video.addEventListener('seeked', () => {
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = 90; canvas.height = 160;
+        const ctx = canvas.getContext('2d');
+        const scale = Math.max(canvas.width / video.videoWidth, canvas.height / video.videoHeight);
+        const w = video.videoWidth * scale, h = video.videoHeight * scale;
+        ctx.drawImage(video, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
+        t.thumb = canvas.toDataURL('image/jpeg', 0.7);
+      } catch (err) { /* codec sin soporte de canvas, etc. – fail-open, sin miniatura */ }
+      cleanup();
+      resolve();
+    });
+    video.addEventListener('error', () => { cleanup(); resolve(); });
+  });
+}
 
 // Reordenar arrastrando: cada <li> es draggable; al soltar sobre otro
 // se intercambian posiciones en el array `tomas` (fuente de verdad) y se
@@ -913,10 +1052,14 @@ function renderList() {
     const reusedBadge = t.existing ? `<span class="reused" title="Reusada de un proyecto anterior">↺</span>` : '';
     const hasTrim = t.trimStart != null || t.trimEnd != null;
     const canTrim = !t.existing;
+    const thumb = t.thumb
+      ? `<span class="thumb" style="background-image:url('${t.thumb}')"></span>`
+      : `<span class="thumb thumb-empty">${t.existing ? '↺' : '⋯'}</span>`;
 
     const row = document.createElement('div');
     row.className = 'filelist-row';
     row.innerHTML = `<span class="grip">⠿</span>` +
+      thumb +
       `<span class="n">${i+1}</span>` +
       `<span class="name">${t.name}</span>` + reusedBadge +
       `<span class="size">${(t.size/1048576).toFixed(1)} MB</span>` +
@@ -1088,6 +1231,9 @@ async function reopenProject(jobId) {
     setValue('accent', o.accent);
     setValue('font', o.font);
     setValue('subpos', o.subpos);
+    setChecked('subBold', o.sub_bold !== undefined ? o.sub_bold : true);
+    setChecked('subItalic', o.sub_italic);
+    setValue('subLines', o.sub_lines || 2);
 
     closeHistoryModal();
     const status = document.getElementById('status');
@@ -1320,6 +1466,9 @@ document.getElementById('go').addEventListener('click', async () => {
   if (el('transition'))  fd.append('transition', el('transition').value);
   if (el('accent'))      fd.append('accent', el('accent').value);
   if (el('font'))        fd.append('font', el('font').value);
+  if (el('subBold'))     fd.append('sub_bold', el('subBold').checked ? 'on' : '');
+  if (el('subItalic'))   fd.append('sub_italic', el('subItalic').checked ? 'on' : '');
+  if (el('subLines'))    fd.append('sub_lines', el('subLines').value);
   if (el('subpos'))      fd.append('subpos', el('subpos').value);
   if (el('sfxfile') && el('sfxfile').files[0]) fd.append('sfx', el('sfxfile').files[0]);
   if (el('musicfile') && el('musicfile').files[0]) {
@@ -1348,6 +1497,29 @@ document.getElementById('go').addEventListener('click', async () => {
   }
 
   go.disabled = false;
+});
+
+// Guardar como: en la ventana nativa (pywebview) usamos el diálogo de
+// "Guardar como" del sistema vía el puente Api.save_file (elegís carpeta
+// Y nombre ahí mismo). El <a download> de un navegador normal no deja
+// elegir ninguna de las dos cosas – solo cae ahí en modo navegador
+// (MINIEDITOR_BROWSER=1), donde no hay puente pywebview disponible.
+async function saveViaDialog(url, filename, kind) {
+  const jobId = url.split('/').filter(Boolean).pop();
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.save_file) {
+    const res = await window.pywebview.api.save_file(jobId, filename, kind);
+    if (res && res.ok) return;
+    if (res && !res.cancelled) alert('No se pudo guardar: ' + (res.error || 'error desconocido'));
+    return;
+  }
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('.dl-btn');
+  if (!btn) return;
+  saveViaDialog(btn.dataset.url, btn.dataset.name, btn.dataset.kind);
 });
 
 // El render corre en background en el servidor; acá solo preguntamos
@@ -1384,10 +1556,12 @@ async function pollStatus(jobId) {
       status.innerHTML = 'Listo. Gates: ' + (data.all_green
         ? '<span class="status-ok">todos ✅</span>' : 'revisar ⚠');
       const coverImg = data.cover_url ? `<img class="cover" src="${data.cover_url}" alt="Portada sugerida">` : '';
-      const coverLink = data.cover_url ? `<a class="secondary" href="${data.cover_url}" download>⬇ Portada sugerida (JPG)</a>` : '';
+      const coverLink = data.cover_url
+        ? `<button type="button" class="dl-btn secondary" data-url="${data.cover_url}" data-name="Edito_portada.jpg" data-kind="cover">⬇ Portada sugerida (JPG)</button>`
+        : '';
       result.innerHTML = `<div class="fade-in">` + coverImg +
                          `<video id="preview" src="${data.preview_url}" controls playsinline></video>` +
-                         `<a href="${data.url}" download>⬇ Descargar MP4</a>` +
+                         `<button type="button" class="dl-btn" data-url="${data.url}" data-name="Edito.mp4" data-kind="video">⬇ Descargar MP4</button>` +
                          coverLink +
                          `<div class="gates">${data.gates}</div></div>`;
       setTimeout(() => { progwrap.style.display = 'none'; }, 600);
@@ -1472,27 +1646,89 @@ function renderSubsReview(jobId, words) {
   });
 }
 
-// Chequeo de actualización: una sola vez al abrir, en segundo plano. Sin
-// UPDATE_REPO configurado en app.py, /update-check devuelve siempre "sin
-// novedades" – este fetch nunca bloquea nada, solo muestra el banner si
-// hay algo nuevo.
-(async () => {
+// El banner de actualización ya viene resuelto del lado del servidor
+// (ver index() en app.py) – acá solo hace falta el botón de cerrar, que
+// saca el elemento del DOM directo (nada que mostrar/ocultar con clases:
+// si no hay actualización, el div ni existe en la página).
+document.getElementById('updateDismiss')?.addEventListener('click', (e) => {
+  e.currentTarget.closest('.update-banner').remove();
+});
+
+// Botón "Actualizar": baja el .exe nuevo con progreso y, en la ventana
+// nativa, se reemplaza y reabre solo. En modo navegador (sin puente
+// pywebview) no hay forma de reemplazar el .exe desde ahí – cae al link
+// directo de GitHub de siempre, que el navegador descarga por su cuenta.
+(() => {
   const banner = document.getElementById('updateBanner');
   if (!banner) return;
-  try {
-    const resp = await fetch('/update-check');
-    const data = await resp.json();
-    if (!data.ok || !data.update_available) return;
-    document.getElementById('updateText').textContent =
-      `Hay una versión nueva de Edito (v${data.latest_version}) – la tuya es v${data.current_version}.`;
-    const link = document.getElementById('updateDownload');
-    link.href = data.download_url || data.notes_url || '#';
-    banner.classList.remove('hidden');
-  } catch (err) { /* fail-open: sin internet o sin repo, la app sigue normal */ }
+  const btn = document.getElementById('updateActionBtn');
+  const msg = document.getElementById('updateMsg');
+  const progwrap = document.getElementById('updateProgwrap');
+  const progfill = document.getElementById('updateProgfill');
+  const progpct = document.getElementById('updateProgpct');
+  const fallbackUrl = banner.dataset.url;
+  let state = 'idle';
+
+  async function pollDownload() {
+    while (state === 'downloading') {
+      await new Promise(r => setTimeout(r, 500));
+      let data;
+      try {
+        const resp = await fetch('/update/status?t=' + Date.now(), { cache: 'no-store' });
+        data = await resp.json();
+      } catch (err) { continue; }
+      if (data.status === 'downloading') {
+        const pct = data.percent || 0;
+        progfill.style.width = pct + '%';
+        progpct.textContent = pct + '%';
+      } else if (data.status === 'ready') {
+        state = 'ready';
+        progwrap.style.display = 'none';
+        btn.disabled = false;
+        btn.textContent = 'Reiniciar y actualizar';
+      } else if (data.status === 'error') {
+        state = 'error';
+        progwrap.style.display = 'none';
+        btn.disabled = false;
+        btn.textContent = 'Reintentar';
+        msg.textContent = 'No se pudo descargar la actualización. Probá de nuevo.';
+      }
+    }
+  }
+
+  btn.addEventListener('click', async () => {
+    const api = window.pywebview && window.pywebview.api;
+    if (!api || !api.apply_update) {
+      window.open(fallbackUrl, '_blank');
+      return;
+    }
+    if (state === 'ready') {
+      btn.disabled = true;
+      btn.textContent = 'Reiniciando…';
+      await api.apply_update();  // si funciona, la app se cierra acá mismo
+      return;
+    }
+    if (state === 'idle' || state === 'error') {
+      state = 'downloading';
+      btn.disabled = true;
+      btn.textContent = 'Descargando…';
+      progwrap.style.display = 'flex';
+      progfill.style.width = '0%';
+      progpct.textContent = '0%';
+      try {
+        const resp = await fetch('/update/download', { method: 'POST' });
+        const data = await resp.json();
+        if (!data.ok) throw new Error(data.error || 'no se pudo iniciar');
+        pollDownload();
+      } catch (err) {
+        state = 'error';
+        progwrap.style.display = 'none';
+        btn.disabled = false;
+        btn.textContent = 'Reintentar';
+      }
+    }
+  });
 })();
-document.getElementById('updateDismiss')?.addEventListener('click', () => {
-  document.getElementById('updateBanner').classList.add('hidden');
-});
 </script>
 </body>
 </html>
@@ -1502,7 +1738,24 @@ document.getElementById('updateDismiss')?.addEventListener('click', () => {
 @app.get("/")
 def index():
     return render_template_string(PAGE, features=type("F", (), FEATURES),
-                                   font_choices=FONT_CHOICES, favicon=FAVICON_HREF)
+                                   font_choices=FONT_CHOICES, favicon=FAVICON_HREF,
+                                   embedded_fonts=EMBEDDED_FONT_FILES,
+                                   update=_check_for_update())
+
+
+@app.after_request
+def _no_cache_index(resp):
+    # WebView2 (la ventana nativa) tiene su propio caché en disco que
+    # sobrevive a cerrar y reabrir la app entera (no es como una pestaña
+    # de navegador que arranca de cero) – sin esto, un relanzamiento podría
+    # seguir sirviendo la página vieja de caché en vez de pedirla de
+    # nuevo. /preview, /cover, /download quedan afuera a propósito: esos
+    # SÍ quieren cachear/soportar range requests (conditional=True en
+    # send_file).
+    if request.path == "/":
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+    return resp
 
 
 def _await_subs_review(job_id: str, words: list[dict]) -> list[dict]:
@@ -1629,7 +1882,10 @@ def _run_job(job_id: str, job_dir: str, paths: list[str], options: dict,
                 ass = captions.build_ass(words, os.path.join(workdir, "subs.ass"),
                                          accent=options["accent"],
                                          font=options["font"],
-                                         position=options["subpos"])
+                                         position=options["subpos"],
+                                         bold=options["sub_bold"],
+                                         italic=options["sub_italic"],
+                                         max_lines=options["sub_lines"])
                 video = captions.burn(video, ass, workdir)
 
         # 7 · gates sobre el entregable. check_edges y cut_times solo si
@@ -1819,6 +2075,14 @@ def do_render():
     subpos = request.form.get("subpos", "abajo")
     if subpos not in {"arriba", "medio", "abajo"}:
         subpos = "abajo"
+    sub_bold = request.form.get("sub_bold", "on") == "on"
+    sub_italic = request.form.get("sub_italic") == "on"
+    try:
+        sub_lines = int(request.form.get("sub_lines", 2))
+    except (TypeError, ValueError):
+        sub_lines = 2
+    if sub_lines not in (1, 2):
+        sub_lines = 2
 
     # SFX (Feature 4): opcional, un solo archivo para todos los cortes.
     # Sin sidecar .peak (el usuario lo acaba de subir), así que medimos el
@@ -1893,7 +2157,8 @@ def do_render():
 
     options = {"cut_silence": cut_silence, "hook_punch": hook_punch, "subs": subs,
                "transition": transition, "accent": accent, "font": font,
-               "subpos": subpos, "sfx_path": sfx_path, "sfx_peak": sfx_peak,
+               "subpos": subpos, "sub_bold": sub_bold, "sub_italic": sub_italic,
+               "sub_lines": sub_lines, "sfx_path": sfx_path, "sfx_peak": sfx_peak,
                "sfx_gaps": sfx_gaps, "music_path": music_path, "music_gain": music_gain,
                "music_start": music_start, "music_end": music_end, "music_duck": music_duck}
 
@@ -1979,6 +2244,15 @@ def cover(job_id):
     if not os.path.exists(path):
         return "No existe esa portada", 404
     return send_file(path, as_attachment=False, conditional=True)
+
+
+@app.get("/fonts/<path:filename>")
+def font_file(filename):
+    """Sirve las fuentes propias (assets/fonts/) para el @font-face del
+    preview – whitelist explícita, nunca un path arbitrario del disco."""
+    if filename not in EMBEDDED_FONT_FILES.values():
+        return "No existe esa fuente", 404
+    return send_from_directory(FONTS_DIR, filename, conditional=True)
 
 
 def _job_meta(safe_id: str) -> dict | None:
@@ -2069,11 +2343,14 @@ def _version_tuple(v: str) -> tuple[int, ...]:
     return tuple(int(p) if p.isdigit() else 0 for p in v.split("."))
 
 
-@app.get("/update-check")
-def update_check():
+def _check_for_update(timeout: int = 2) -> dict:
     """Fail-open: sin UPDATE_REPO configurado, o si GitHub no responde,
     simplemente no hay novedades – nunca bloquea ni ensucia el arranque.
-    Timeout corto (4s) porque esto corre en cada apertura de la app."""
+
+    Se llama DIRECTO desde index() (no vía fetch de JS – ver el comentario
+    en el <template>, más abajo, para el porqué). Timeout corto porque
+    esto ahora corre sincrónico en cada carga de "/", que solo pasa una
+    vez al abrir la app."""
     no_update = {"ok": True, "update_available": False, "current_version": EDITO_VERSION}
     if not UPDATE_REPO or "/" not in UPDATE_REPO:
         return no_update
@@ -2081,7 +2358,7 @@ def update_check():
         req = urllib.request.Request(
             f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
             headers={"Accept": "application/vnd.github+json", "User-Agent": "Edito-updater"})
-        with urllib.request.urlopen(req, timeout=4) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.load(resp)
         latest = str(data.get("tag_name", "")).lstrip("vV")
         if _version_tuple(latest) <= _version_tuple(EDITO_VERSION):
@@ -2096,6 +2373,66 @@ def update_check():
                 "notes_url": data.get("html_url")}
     except (urllib.error.URLError, TimeoutError, ValueError, OSError):
         return no_update
+
+
+def _download_update_bg(url: str, dest: str) -> None:
+    """Baja el .exe nuevo a `dest`, reportando progreso en UPDATE_DL_STATE
+    (mismo patrón que _run_job/JOBS). Corre en un hilo aparte – nunca
+    bloquea la UI mientras descarga ~270MB."""
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        req = urllib.request.Request(url, headers={"User-Agent": "Edito-updater"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            downloaded = 0
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    pct = round(downloaded / total * 100) if total else 0
+                    with UPDATE_DL_LOCK:
+                        UPDATE_DL_STATE.update(status="downloading", percent=pct)
+        # Sanity check: un .exe con ffmpeg+whisper embebido pesa cientos de
+        # MB – si quedó muy chico, la descarga se cortó a mitad de camino.
+        # Nunca dejamos que algo así se copie encima del .exe que funciona.
+        if total and downloaded < total:
+            raise OSError(f"descarga incompleta: {downloaded}/{total} bytes")
+        if os.path.getsize(dest) < 10_000_000:
+            raise OSError("el archivo bajado es demasiado chico, parece corrupto")
+        with UPDATE_DL_LOCK:
+            UPDATE_DL_STATE.update(status="ready", percent=100, path=dest)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        with UPDATE_DL_LOCK:
+            UPDATE_DL_STATE.update(status="error", error=str(e))
+
+
+@app.post("/update/download")
+def update_download():
+    """Arranca (o reusa, si ya está en curso) la descarga del .exe nuevo.
+
+    A propósito NO toma la URL del client – la vuelve a resolver acá
+    mismo contra GitHub, así nunca hay una URL controlada por el
+    navegador llegando a un download-a-disco del lado del servidor."""
+    info = _check_for_update()
+    if not info.get("update_available"):
+        return {"ok": False, "error": "No hay actualización disponible."}, 400
+    with UPDATE_DL_LOCK:
+        if UPDATE_DL_STATE.get("status") != "downloading":
+            UPDATE_DL_STATE.clear()
+            UPDATE_DL_STATE.update(status="downloading", percent=0)
+            dest = os.path.join(DATA_DIR, "update_download", "Edito_new.exe")
+            threading.Thread(target=_download_update_bg,
+                              args=(info["download_url"], dest), daemon=True).start()
+    return {"ok": True}
+
+
+@app.get("/update/status")
+def update_status():
+    with UPDATE_DL_LOCK:
+        return {k: v for k, v in UPDATE_DL_STATE.items() if k != "path"}
 
 
 @app.get("/presets")
@@ -2175,9 +2512,75 @@ if __name__ == "__main__":
             except Exception:
                 pass
 
+        class Api:
+            """Puente JS→Python para cosas que el WebView2 sandboxed no
+            puede hacer solo: abrir el diálogo nativo de "Guardar como"
+            (save_file) y reemplazarse a sí mismo con la versión nueva ya
+            descargada (apply_update). pywebview expone este objeto como
+            `window.pywebview.api` en el JS de la página."""
+
+            def save_file(self, job_id: str, filename: str, kind: str = "video") -> dict:
+                safe = "".join(c for c in job_id if c.isalnum())
+                src_name = "final.mp4" if kind == "video" else "cover.jpg"
+                src = os.path.join(JOBS_DIR, safe, src_name)
+                if not os.path.isfile(src):
+                    return {"ok": False, "error": "No existe ese archivo"}
+                ext = "mp4" if kind == "video" else "jpg"
+                label = "Video MP4" if kind == "video" else "Imagen JPG"
+                result = webview.windows[0].create_file_dialog(
+                    webview.FileDialog.SAVE, save_filename=filename,
+                    file_types=(f"{label} (*.{ext})",))
+                if not result:
+                    return {"ok": False, "cancelled": True}
+                dest = result[0]
+                shutil.copyfile(src, dest)
+                return {"ok": True, "path": dest}
+
+            def apply_update(self) -> dict:
+                """Reemplaza este .exe por el nuevo ya descargado y lo
+                reabre solo.
+
+                Un .exe no puede sobreescribirse a sí mismo mientras corre
+                (Windows lo tiene bloqueado) – por eso el swap lo hace un
+                script .bat aparte, DETACHED (sobrevive aunque este
+                proceso muera), que reintenta el copy en loop hasta que
+                el archivo se libera (apenas cerramos la ventana) y
+                recién ahí relanza el .exe. Esta función solo dispara ese
+                script y cierra la ventana; no espera nada después,
+                porque el proceso entero se va a terminar."""
+                with UPDATE_DL_LOCK:
+                    ready = UPDATE_DL_STATE.get("status") == "ready"
+                    new_exe = UPDATE_DL_STATE.get("path")
+                if not ready or not new_exe or not os.path.isfile(new_exe):
+                    return {"ok": False, "error": "La descarga todavía no terminó."}
+                if not getattr(sys, "frozen", False):
+                    return {"ok": False, "error": "Solo disponible en la versión empaquetada."}
+
+                old_exe = sys.executable
+                bat_path = os.path.join(tempfile.gettempdir(), "edito_update.bat")
+                bat = (
+                    "@echo off\r\n"
+                    ":retry\r\n"
+                    f'copy /Y "{new_exe}" "{old_exe}" >NUL 2>&1\r\n'
+                    "if errorlevel 1 (\r\n"
+                    "  timeout /t 1 /nobreak >NUL\r\n"
+                    "  goto retry\r\n"
+                    ")\r\n"
+                    f'start "" "{old_exe}"\r\n'
+                    'del "%~f0"\r\n'
+                )
+                with open(bat_path, "w", encoding="utf-8") as f:
+                    f.write(bat)
+                subprocess.Popen(
+                    ["cmd", "/c", bat_path],
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS)
+                webview.windows[0].destroy()
+                return {"ok": True}
+
         threading.Thread(target=_serve, daemon=True).start()
         webview.create_window("Edito", "http://127.0.0.1:5000",
-                               width=1040, height=820, min_size=(480, 640))
+                               width=1040, height=820, min_size=(480, 640),
+                               js_api=Api())
         # Ícono de ventana/taskbar: mismo isotipo que el header, rasterizado
         # a mano (ver icongen.py) para no sumar Pillow solo por esto.
         icon_path = icongen.ensure_icon(os.path.join(DATA_DIR, "assets", "edito.ico"))

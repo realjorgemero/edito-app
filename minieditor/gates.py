@@ -36,7 +36,7 @@ def _luma(path: str, at_s: float) -> float:
         [ff.FFMPEG, "-v", "quiet", "-ss", f"{at_s:.3f}", "-i", path,
          "-frames:v", "1", "-vf", "scale=64:-1,format=gray",
          "-f", "rawvideo", "-"],
-        capture_output=True, timeout=60)
+        capture_output=True, timeout=60, creationflags=ff.NO_WINDOW_FLAGS)
     return sum(p.stdout) / len(p.stdout) if p.stdout else 0.0
 
 

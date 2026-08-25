@@ -36,7 +36,7 @@ def _frame_stats(path: str, at_s: float) -> tuple[float, float] | None:
         [ff.FFMPEG, "-v", "quiet", "-ss", f"{at_s:.3f}", "-i", path,
          "-frames:v", "1", "-vf", "scale=64:-1,format=gray",
          "-f", "rawvideo", "-"],
-        capture_output=True, timeout=60)
+        capture_output=True, timeout=60, creationflags=ff.NO_WINDOW_FLAGS)
     if not p.stdout:
         return None
     n = len(p.stdout)
@@ -67,5 +67,5 @@ def pick_cover(video: str, out_path: str, duration_s: float) -> str | None:
     p = subprocess.run(
         [ff.FFMPEG, "-y", "-v", "quiet", "-ss", f"{best_t:.3f}", "-i", video,
          "-frames:v", "1", "-q:v", "2", out_path],
-        capture_output=True, timeout=60)
+        capture_output=True, timeout=60, creationflags=ff.NO_WINDOW_FLAGS)
     return out_path if p.returncode == 0 and os.path.exists(out_path) else None

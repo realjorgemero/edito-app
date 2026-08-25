@@ -30,7 +30,7 @@ def measure_peak(path: str) -> float:
     p = subprocess.run(
         [ff.FFMPEG, "-v", "quiet", "-i", path, "-ac", "1", "-ar", str(SR),
          "-f", "s16le", "-"],
-        capture_output=True, timeout=60)
+        capture_output=True, timeout=60, creationflags=ff.NO_WINDOW_FLAGS)
     raw = p.stdout
     n = len(raw) // 2
     if n == 0:
