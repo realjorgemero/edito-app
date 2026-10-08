@@ -126,9 +126,13 @@ def build_ass(words: list[dict], out_path: str, canvas_w: int = 1080,
               canvas_h: int = 1920, accent: str = "#F4DC1A",
               font: str = FONT, position: str = "abajo",
               bold: bool = True, italic: bool = False,
-              max_lines: int = MAX_LINES) -> str:
+              max_lines: int = MAX_LINES, pop: bool = False) -> str:
     """words: [{"w": str, "t0": float, "t1": float}] en tiempo ABSOLUTO
-    del video final. Genera el .ass y devuelve su ruta."""
+    del video final. Genera el .ass y devuelve su ruta.
+
+    pop: la palabra que se está diciendo entra a 118 % y vuelve a 100 % en
+    90 ms (estilo TikTok). Lo usa la edición automática (autoedit.py); el
+    modo manual sigue igual."""
     accent_ass = _hex_to_ass(accent)
     fontsize = round(canvas_h * 0.0479)          # 4.79 % de la altura
     margin_h = round(canvas_w * 0.1389)          # 13.89 % del ancho
@@ -173,6 +177,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 parts = []
                 for w in line:
                     txt = _sanitize(w["w"])
+                    if pop and k == gi:
+                        txt = r"{\fscx118\fscy118\t(0,90,\fscx100\fscy100)}" + txt + r"{\fscx100\fscy100}"
                     if k > gi:      # todavía no dicha – tenue
                         parts.append(
                             rf"{{\1c&HFFFFFF&\alpha&H{INACTIVE_ALPHA}&}}{txt}")

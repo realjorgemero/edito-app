@@ -64,7 +64,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 from flask import Flask, render_template_string, request, send_file, send_from_directory
 
 import icongen
-from minieditor import asr, captions, concat, gates, loudnorm, music, normalize, sfx, thumbnail, trim
+from minieditor import asr, autoedit, captions, concat, gates, loudnorm, music, normalize, revision, sfx, thumbnail, trim
 from minieditor.edl import Boundary, Edl
 from minieditor.ff import stream_duration
 from minieditor.peaks import measure_peak
@@ -76,7 +76,7 @@ from minieditor.peaks import measure_peak
 # nunca bloquea el arranque de la app). Se resuelve DENTRO de index(),
 # no vía un fetch de JS aparte – ver el comentario en el <template> de
 # PAGE, cerca de "update-banner", para el porqué.
-EDITO_VERSION = "1.1.0"
+EDITO_VERSION = "1.2.0"
 UPDATE_REPO = "realjorgemero/edito-app"
 # ─────────────────────────────────────────────────────────────────────
 
@@ -435,6 +435,16 @@ PAGE = """
            background:rgba(0,0,0,.35); border:1px solid rgba(255,255,255,.06);
            border-radius:14px; padding:16px; margin-top:14px; }
   .err { color:var(--bad); white-space:pre-wrap; font-size:13px; }
+  /* Revisión final: video editado afuera (CapCut) → volumen + controles. */
+  .rev-row { display:flex; flex-direction:column; gap:10px; }
+  .rev-row input[type=text] { background:rgba(255,255,255,.04); border:1px solid var(--card-border);
+          color:var(--ink); border-radius:10px; padding:10px 12px; font:inherit; }
+  .rev-checks { list-style:none; padding:0; margin:12px 0 0; display:flex; flex-direction:column; gap:8px; }
+  .rev-checks li { font-size:13px; line-height:1.45; color:var(--ink); }
+  .rev-checks .bad { color:var(--bad); font-weight:600; }
+  .rev-checks .warn { color:#ffc861; font-weight:600; }
+  .rev-checks .good { color:var(--ok); font-weight:600; }
+  .rev-manual { margin-top:12px; font-size:12px; color:var(--dim); }
   .spin { display:inline-block; width:14px; height:14px; border:2px solid var(--dim);
           border-top-color:var(--blue2); border-radius:50%;
           animation:r 0.8s linear infinite; vertical-align:-2px; margin-right:8px; }
@@ -800,6 +810,40 @@ PAGE = """
   {% endif %}
 
   <button class="go" id="go">Editar video</button>
+
+  <div class="card" style="margin-top:22px">
+    <div class="cardhead"><span class="steptag">⚡</span><h2>Edición automática (estilo anuncio)</h2></div>
+    <p class="hint">Usa las tomas de arriba, en ese orden. Edito corta las pausas, alterna
+    acercamientos en cada corte, pone subtítulos animados con el guion, deja el volumen en
+    -14 LUFS y revisa el cierre. Con el paquete de INFLUWA, los subtítulos usan el guion exacto.
+    Cada hook alternativo da otro video con el mismo cuerpo.</p>
+    <div class="rev-row">
+      <label class="addbtn" for="autoPaquete">📦 Paquete de INFLUWA (opcional)</label>
+      <input type="file" id="autoPaquete" accept=".json,application/json" style="display:none">
+      <div id="autoPaqueteInfo" class="hint"></div>
+      <label class="addbtn" for="autoHooks">🎣 Hooks alternativos (opcional)</label>
+      <input type="file" id="autoHooks" accept="video/mp4,video/quicktime,video/*" multiple style="display:none">
+      <div id="autoHooksInfo" class="hint"></div>
+      <input type="text" id="autoProducto" placeholder="Nombre del producto (ej. MaxCalm)">
+      <button class="go" id="autoGo" type="button">Editar automático</button>
+    </div>
+    <div id="autoStatus"></div>
+    <div id="autoResult"></div>
+  </div>
+
+  <div class="card" style="margin-top:22px">
+    <div class="cardhead"><span class="steptag">✓</span><h2>Revisión final (video ya editado)</h2></div>
+    <p class="hint">¿Lo editaste en CapCut? Subí el MP4 terminado: Edito deja el volumen en
+    -14 LUFS (el de los anuncios que ganan) y revisa arranque, pausas, ritmo, que se
+    entienda el nombre del producto y que el cierre pida la compra.</p>
+    <div class="rev-row">
+      <input type="file" id="revFile" accept="video/mp4,video/quicktime,video/*">
+      <input type="text" id="revProducto" placeholder="Nombre del producto (ej. MaxCalm)">
+      <button class="go" id="revGo" type="button">Revisar y dejar listo</button>
+    </div>
+    <div id="revStatus"></div>
+    <div id="revResult"></div>
+  </div>
 </div>
 
 <div class="side">
@@ -1505,7 +1549,11 @@ document.getElementById('go').addEventListener('click', async () => {
 // elegir ninguna de las dos cosas – solo cae ahí en modo navegador
 // (MINIEDITOR_BROWSER=1), donde no hay puente pywebview disponible.
 async function saveViaDialog(url, filename, kind) {
-  const jobId = url.split('/').filter(Boolean).pop();
+  // url puede traer ?f=final_h2.mp4 (edición automática con varios hooks)
+  const [path, query] = url.split('?');
+  const jobId = path.split('/').filter(Boolean).pop();
+  const f = new URLSearchParams(query || '').get('f');
+  if (f && kind === 'video') kind = 'video:' + f;
   if (window.pywebview && window.pywebview.api && window.pywebview.api.save_file) {
     const res = await window.pywebview.api.save_file(jobId, filename, kind);
     if (res && res.ok) return;
@@ -1520,6 +1568,119 @@ document.addEventListener('click', (e) => {
   const btn = e.target.closest('.dl-btn');
   if (!btn) return;
   saveViaDialog(btn.dataset.url, btn.dataset.name, btn.dataset.kind);
+});
+
+// Edición automática (minieditor/autoedit.py). Usa la lista `tomas` de
+// arriba en su orden; el paquete de INFLUWA aporta guion y códigos.
+let autoPaquete = {};
+const escHtml = t => String(t ?? '').replace(/[&<>"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
+document.getElementById('autoPaquete').addEventListener('change', async (e) => {
+  const info = document.getElementById('autoPaqueteInfo');
+  const f = e.target.files[0];
+  autoPaquete = {};
+  if (!f) { info.textContent = ''; return; }
+  try {
+    autoPaquete = JSON.parse(await f.text());
+    const n = (autoPaquete.tomas || []).length, h = (autoPaquete.hooks || []).length;
+    info.innerHTML = `Paquete <b>${escHtml(autoPaquete.codigo || '')}</b>: ${n} tomas` +
+      (h ? ` · ${h} hooks alternativos` : '') +
+      (n && tomas.length && n !== tomas.length ? ` <span class="warn">⚠ hay ${tomas.length} tomas cargadas</span>` : '') +
+      (n ? '<br>' + (autoPaquete.tomas || []).map((t, i) => `${i + 1}. ${escHtml(t.archivo || t.id || '')}`).join('<br>') : '');
+    if (autoPaquete.producto && !document.getElementById('autoProducto').value) {
+      document.getElementById('autoProducto').value = autoPaquete.producto;
+    }
+  } catch (err) {
+    info.innerHTML = '<span class="bad">Ese archivo no es un paquete válido.</span>';
+  }
+});
+document.getElementById('autoHooks').addEventListener('change', (e) => {
+  const names = Array.from(e.target.files).map((f, i) => `Hook ${i + 2}: ${escHtml(f.name)}`);
+  document.getElementById('autoHooksInfo').innerHTML = names.join('<br>');
+});
+document.getElementById('autoGo').addEventListener('click', async () => {
+  const st = document.getElementById('autoStatus');
+  const out = document.getElementById('autoResult');
+  const btn = document.getElementById('autoGo');
+  if (!tomas.length) { st.innerHTML = '<div class="err">Agregá las tomas arriba, en orden.</div>'; return; }
+  if (tomas.some(t => t.existing || !t.file)) { st.innerHTML = '<div class="err">La edición automática usa tomas nuevas: volvé a agregarlas desde la computadora.</div>'; return; }
+  const fd = new FormData();
+  tomas.forEach(t => fd.append('clips', t.file));
+  Array.from(document.getElementById('autoHooks').files).forEach(f => fd.append('hooks', f));
+  fd.append('paquete', JSON.stringify(autoPaquete || {}));
+  fd.append('producto', document.getElementById('autoProducto').value || '');
+  const el = id => document.getElementById(id);
+  if (el('font')) fd.append('font', el('font').value);
+  if (el('accent')) fd.append('accent', el('accent').value);
+  if (el('subpos')) fd.append('subpos', el('subpos').value);
+  btn.disabled = true; out.innerHTML = '';
+  st.innerHTML = '<span class="spin"></span>Subiendo tomas…';
+  let job;
+  try { job = await (await fetch('/auto_render', { method: 'POST', body: fd })).json(); }
+  catch (err) { st.innerHTML = `<div class="err">Error de conexión: ${err}</div>`; btn.disabled = false; return; }
+  if (!job.ok) { st.innerHTML = `<div class="err">${escHtml(job.error)}</div>`; btn.disabled = false; return; }
+  while (true) {
+    await new Promise(r => setTimeout(r, 1500));
+    let data;
+    try { data = await (await fetch(`/status/${job.job_id}`)).json(); } catch (err) { continue; }
+    if (!data.ok || data.status === 'error') { st.innerHTML = `<div class="err">${escHtml(data.error)}</div>`; break; }
+    if (data.status !== 'done') { st.innerHTML = `<span class="spin"></span>${escHtml(data.step || 'Editando…')}`; continue; }
+    st.innerHTML = `<span class="status-ok">Listo: ${data.videos.length} video(s) ✅</span>`;
+    out.innerHTML = data.videos.map(v => {
+      const items = v.checks.map(c => {
+        const cls = c.ok ? 'good' : (c.nivel === 'error' ? 'bad' : 'warn');
+        const mark = c.ok ? '✅' : (c.nivel === 'error' ? '❌' : '⚠');
+        return `<li><span class="${cls}">${mark} ${escHtml(c.nombre)}:</span> ${escHtml(c.detalle)}</li>`;
+      }).join('');
+      return `<div class="fade-in" style="margin-top:16px"><h3 style="margin:0 0 6px">${escHtml(v.codigo)}</h3>` +
+        `<div class="hint">${v.duracion}s · se recortaron ${v.recortado_s}s de pausas · ${v.cortes_internos} jump cuts · gates ${v.gates_ok ? '✅' : '⚠'}</div>` +
+        `<ul class="rev-checks">${items}</ul>` +
+        `<video src="${v.preview_url}" controls playsinline style="margin-top:10px"></video>` +
+        `<button type="button" class="dl-btn" data-url="${v.url}" data-name="${escHtml(v.codigo)}.mp4" data-kind="video">⬇ Descargar ${escHtml(v.codigo)}</button></div>`;
+    }).join('');
+    break;
+  }
+  btn.disabled = false;
+});
+
+// Revisión final: mismo patrón de job + polling que el render.
+const REV_MANUAL = ['Los subtítulos arrancan desde el primer fotograma.',
+  'No hay rótulos de escena ni textos raros quemados en la imagen (ej. "S03 (BV)").',
+  'El producto se ve en la mano con su envase real.'];
+document.getElementById('revGo').addEventListener('click', async () => {
+  const f = document.getElementById('revFile').files[0];
+  const st = document.getElementById('revStatus');
+  const out = document.getElementById('revResult');
+  if (!f) { st.innerHTML = '<div class="err">Elegí el video terminado.</div>'; return; }
+  const fd = new FormData();
+  fd.append('video', f);
+  fd.append('producto', document.getElementById('revProducto').value || '');
+  out.innerHTML = '';
+  st.innerHTML = '<span class="spin"></span>Subiendo…';
+  let job;
+  try { job = await (await fetch('/revision', { method: 'POST', body: fd })).json(); }
+  catch (err) { st.innerHTML = `<div class="err">Error de conexión: ${err}</div>`; return; }
+  if (!job.ok) { st.innerHTML = `<div class="err">${job.error}</div>`; return; }
+  while (true) {
+    await new Promise(r => setTimeout(r, 1200));
+    const data = await (await fetch(`/status/${job.job_id}`)).json();
+    if (!data.ok || data.status === 'error') { st.innerHTML = `<div class="err">${data.error}</div>`; return; }
+    if (data.status !== 'done') { st.innerHTML = `<span class="spin"></span>${data.step || 'Revisando…'}`; continue; }
+    const r = data.revision;
+    const fallas = r.checks.filter(c => !c.ok && c.nivel === 'error').length;
+    st.innerHTML = fallas ? `<div class="err">${fallas} problema(s) para corregir antes de publicar.</div>`
+                          : '<span class="status-ok">Listo para publicar ✅</span>';
+    const esc = t => String(t).replace(/[&<>]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]));
+    const items = r.checks.map(c => {
+      const cls = c.ok ? 'good' : (c.nivel === 'error' ? 'bad' : 'warn');
+      const mark = c.ok ? '✅' : (c.nivel === 'error' ? '❌' : '⚠');
+      return `<li><span class="${cls}">${mark} ${esc(c.nombre)}:</span> ${esc(c.detalle)}</li>`;
+    }).join('');
+    out.innerHTML = `<div class="fade-in"><ul class="rev-checks">${items}</ul>` +
+      `<div class="rev-manual">Revisá a ojo:<br>${REV_MANUAL.map(t => '☐ ' + t).join('<br>')}</div>` +
+      `<video src="${data.preview_url}" controls playsinline style="margin-top:12px"></video>` +
+      `<button type="button" class="dl-btn" data-url="${data.url}" data-name="${esc(f.name.replace(/\.[^.]+$/, ''))}_revisado.mp4" data-kind="video">⬇ Descargar MP4 con volumen corregido</button></div>`;
+    return;
+  }
 });
 
 // El render corre en background en el servidor; acá solo preguntamos
@@ -2172,6 +2333,132 @@ def do_render():
     return {"ok": True, "job_id": job_id}
 
 
+def _run_revision(job_id: str, job_dir: str, video: str, producto: str) -> None:
+    """Revisión final en un hilo aparte (ver minieditor/revision.py)."""
+    def step(msg: str) -> None:
+        with JOBS_LOCK:
+            JOBS[job_id]["step"] = msg
+    workdir = tempfile.mkdtemp(prefix=f"miniedit_rev_{job_id}_")
+    try:
+        result = revision.revisar(video, job_dir, workdir, producto, on_step=step)
+        with JOBS_LOCK:
+            JOBS[job_id].update(status="done", step="Listo", progress=100, revision=result,
+                                url=f"/download/{job_id}", preview_url=f"/preview/{job_id}")
+    except Exception as e:  # fail-loud: la revisión es lo esencial de este job
+        traceback.print_exc()
+        with JOBS_LOCK:
+            JOBS[job_id].update(status="error", error=f"No se pudo revisar: {e}")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+@app.post("/revision")
+def do_revision():
+    """Revisión final de un video editado afuera. Deja final.mp4 en el job,
+    así /download y /preview funcionan igual que en un render. Sin
+    meta.json a propósito: no es un proyecto y no va al Historial."""
+    f = request.files.get("video")
+    if not f or not f.filename:
+        return {"ok": False, "error": "Subí el video terminado."}, 400
+    _cleanup_old_jobs()
+    job_id = uuid.uuid4().hex[:10]
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    os.makedirs(job_dir)
+    video = os.path.join(job_dir, "original.mp4")
+    f.save(video)
+    producto = (request.form.get("producto") or "").strip()[:60]
+    with JOBS_LOCK:
+        JOBS[job_id] = {"status": "running", "step": "En cola…", "progress": 0, "created": time.time()}
+    threading.Thread(target=_run_revision, args=(job_id, job_dir, video, producto), daemon=True).start()
+    return {"ok": True, "job_id": job_id}
+
+
+def _run_auto(job_id: str, job_dir: str, paths: list[str], hooks: list[str],
+              paquete: dict, producto: str, estilo: dict) -> None:
+    """Edición automática (minieditor/autoedit.py): un video con los clips en
+    orden y, si hay hooks alternativos, uno más por cada hook con el mismo
+    cuerpo. El cuerpo se procesa una sola vez (Cache)."""
+    workdir = tempfile.mkdtemp(prefix=f"miniedit_auto_{job_id}_")
+    tomas = paquete.get("tomas") or []
+    guiones = [str((tomas[i] or {}).get("guion") or "") if i < len(tomas) else "" for i in range(len(paths))]
+    hooks_paquete = paquete.get("hooks") or []
+    codigo = str(paquete.get("codigo") or "Edito")[:60]
+    variantes = [(paths, guiones, "final.mp4", codigo)]
+    for n, h in enumerate(hooks, start=2):
+        g = hooks_paquete[n - 2] if n - 2 < len(hooks_paquete) else {}
+        variantes.append(([h] + paths[1:], [str(g.get("guion") or "")] + guiones[1:],
+                          f"final_h{n}.mp4", str(g.get("codigo") or f"{codigo}-H{n}")[:60]))
+    cache = autoedit.Cache()
+    videos = []
+    try:
+        for k, (clips, gs, nombre, cod) in enumerate(variantes, start=1):
+            def step(msg: str, k=k) -> None:
+                with JOBS_LOCK:
+                    JOBS[job_id]["step"] = f"Video {k} de {len(variantes)} · {msg}"
+                    JOBS[job_id]["progress"] = round(100 * (k - 1) / len(variantes))
+            r = autoedit.render(clips, os.path.join(job_dir, nombre), workdir, cache,
+                                guiones=gs, producto=producto, on_step=step, **estilo)
+            videos.append({
+                "nombre": nombre, "codigo": cod,
+                "url": f"/download/{job_id}?f={nombre}",
+                "preview_url": f"/preview/{job_id}?f={nombre}",
+                "duracion": r["duracion"], "recortado_s": r["recortado_s"],
+                "cortes_internos": r["cortes_internos"],
+                "gates_ok": all(g["ok"] for g in r["gates"].values()),
+                "checks": r["revision"]["checks"],
+            })
+        with JOBS_LOCK:
+            JOBS[job_id].update(status="done", step="Listo", progress=100, videos=videos)
+    except Exception as e:
+        traceback.print_exc()
+        with JOBS_LOCK:
+            JOBS[job_id].update(status="error", error=f"No se pudo editar: {e}")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+@app.post("/auto_render")
+def do_auto_render():
+    """Edición automática: clips en orden (+ hooks alternativos) y, si viene,
+    el paquete de INFLUWA con el guion de cada toma para los subtítulos."""
+    clips = [f for f in request.files.getlist("clips") if f and f.filename]
+    if not clips:
+        return {"ok": False, "error": "Agregá al menos una toma."}, 400
+    hooks = [f for f in request.files.getlist("hooks") if f and f.filename][:9]
+    try:
+        paquete = json.loads(request.form.get("paquete") or "{}")
+        if not isinstance(paquete, dict):
+            paquete = {}
+    except ValueError:
+        return {"ok": False, "error": "El paquete de INFLUWA no es un JSON válido."}, 400
+    _cleanup_old_jobs()
+    job_id = uuid.uuid4().hex[:10]
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    os.makedirs(job_dir)
+    paths, hook_paths = [], []
+    for i, f in enumerate(clips):
+        p = os.path.join(job_dir, f"clip_{i:02d}.mp4")
+        f.save(p)
+        paths.append(p)
+    for i, f in enumerate(hooks):
+        p = os.path.join(job_dir, f"hook_{i:02d}.mp4")
+        f.save(p)
+        hook_paths.append(p)
+    producto = (request.form.get("producto") or paquete.get("producto") or "").strip()[:60]
+    estilo = {}
+    if request.form.get("font"):
+        estilo["font"] = request.form["font"][:60]
+    if re.fullmatch(r"#[0-9A-Fa-f]{6}", request.form.get("accent") or ""):
+        estilo["accent"] = request.form["accent"]
+    if request.form.get("subpos") in ("arriba", "medio", "abajo"):
+        estilo["position"] = request.form["subpos"]
+    with JOBS_LOCK:
+        JOBS[job_id] = {"status": "running", "step": "En cola…", "progress": 0, "created": time.time()}
+    threading.Thread(target=_run_auto, args=(job_id, job_dir, paths, hook_paths, paquete, producto, estilo),
+                     daemon=True).start()
+    return {"ok": True, "job_id": job_id}
+
+
 @app.get("/status/<job_id>")
 def status(job_id):
     with JOBS_LOCK:
@@ -2216,10 +2503,18 @@ def confirm_subs(job_id):
     return {"ok": True}
 
 
+def _safe_output_name(name: str | None) -> str | None:
+    """Solo nombres que deja el propio Edito (final.mp4, final_h2.mp4…):
+    nada de rutas ni caracteres raros que vengan de la URL."""
+    name = (name or "").strip()
+    return name if re.fullmatch(r"final(_h\d{1,2})?\.mp4", name) else None
+
+
 @app.get("/download/<job_id>")
 def download(job_id):
     safe = "".join(c for c in job_id if c.isalnum())
-    path = os.path.join(JOBS_DIR, safe, "final.mp4")
+    name = _safe_output_name(request.args.get("f")) or "final.mp4"
+    path = os.path.join(JOBS_DIR, safe, name)
     if not os.path.exists(path):
         return "No existe ese trabajo", 404
     return send_file(path, as_attachment=True, download_name="editado.mp4")
@@ -2231,7 +2526,8 @@ def preview(job_id):
     attachment) para que el <video> del resultado lo pueda reproducir
     en vez de forzar la descarga."""
     safe = "".join(c for c in job_id if c.isalnum())
-    path = os.path.join(JOBS_DIR, safe, "final.mp4")
+    name = _safe_output_name(request.args.get("f")) or "final.mp4"
+    path = os.path.join(JOBS_DIR, safe, name)
     if not os.path.exists(path):
         return "No existe ese trabajo", 404
     return send_file(path, as_attachment=False, conditional=True)
@@ -2522,6 +2818,11 @@ if __name__ == "__main__":
             def save_file(self, job_id: str, filename: str, kind: str = "video") -> dict:
                 safe = "".join(c for c in job_id if c.isalnum())
                 src_name = "final.mp4" if kind == "video" else "cover.jpg"
+                # Edición automática: un job puede dejar varios videos
+                # (uno por hook). kind = "video:final_h2.mp4".
+                if kind.startswith("video:"):
+                    src_name = _safe_output_name(kind.split(":", 1)[1]) or "final.mp4"
+                    kind = "video"
                 src = os.path.join(JOBS_DIR, safe, src_name)
                 if not os.path.isfile(src):
                     return {"ok": False, "error": "No existe ese archivo"}

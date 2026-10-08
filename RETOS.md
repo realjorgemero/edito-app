@@ -61,6 +61,19 @@ Formato sugerido por ítem: qué, por qué vale la pena, y en qué archivo empie
   sistema) y whisper descargándose la primera vez. Validado corriendo el .exe con el PATH
   del sistema sin ffmpeg – gates en verde.
 
+- **Revisión final (8 oct 2026, sin release todavía).** Para videos editados AFUERA (CapCut):
+  `minieditor/revision.py` + ruta `/revision` + tarjeta "Revisión final" en `app.py`. Lleva el
+  MP4 a -14 LUFS (loudnorm 2 pasadas) y revisa resolución, sincronía, portada, arranque,
+  cierre con pedido (últimos 8 s, whisper), nombre del producto (difflib), pausas ≥0.7 s y
+  ritmo. Lo que no se mide (subtítulos tarde, rótulos quemados) queda como lista a ojo. Nace
+  de la auditoría de Influwa contra el Mentor: nuestros videos estaban 5–10 dB más bajos.
+  No va al Historial (sin meta.json).
+
 ## En curso / propuestas nuevas
 
 _(vacío por ahora — acá van las que surjan de las conversaciones con el agente)_
+- **Edición automática estilo anuncio (8 oct 2026, sin release todavía).** `minieditor/autoedit.py`
+  + `/auto_render` + tarjeta "Edición automática": corta pausas internas con whisper, jump cuts
+  con acercamiento alternado, cortes secos, subtítulos con el guion del paquete de INFLUWA
+  (alineado con difflib) y animación pop (`captions.build_ass(pop=True)`), -14 LUFS, gates y
+  controles de la revisión final. Hooks alternativos → un video por hook, cuerpo cacheado.
